@@ -1,19 +1,19 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl } from 'obsidian';
 
 interface Pdf2MdSettings {
   serviceUrl: string;
   apiKey: string;
-  createSeparateNote: boolean;
   detectTables: boolean;
   autoAuditInvoices: boolean;
+  debugMode: boolean;
 }
 
 const DEFAULT_SETTINGS: Pdf2MdSettings = {
   serviceUrl: 'http://127.0.0.1:3984',
   apiKey: '',
-  createSeparateNote: false,
   detectTables: true,
   autoAuditInvoices: false,
+  debugMode: false,
 };
 
 interface FrenchInvoiceTaxRow {
@@ -134,7 +134,7 @@ export default class Pdf2MdPlugin extends Plugin {
       id: 'convert-pdf-to-markdown',
       name: 'Convert PDF file to Markdown',
       editorCallback: (editor: Editor, _view: MarkdownView) => {
-        this.promptPdfConversion(editor, { audit: false });
+        this.promptPdfConversion({ audit: false });
       },
     });
 
@@ -142,7 +142,7 @@ export default class Pdf2MdPlugin extends Plugin {
     this.addCommand({
       id: 'convert-pdf-and-audit-invoice',
       name: 'Convert PDF and audit as French invoice',
-      callback: () => this.promptPdfConversion(undefined, { audit: true }),
+      callback: () => this.promptPdfConversion({ audit: true }),
     });
 
     // 2c. Copy the active note's invoice audit as Excel/Sheets TSV
@@ -198,7 +198,7 @@ export default class Pdf2MdPlugin extends Plugin {
 
     // 4. Drag-and-drop listener on active markdown editor
     this.registerEvent(
-      this.app.workspace.on('editor-drop', async (evt: DragEvent, editor: Editor, view: MarkdownView) => {
+      this.app.workspace.on('editor-drop', async (evt: DragEvent, _editor: Editor, view: MarkdownView) => {
         const files = evt.dataTransfer?.files;
         if (!files || files.length === 0) return;
 
@@ -212,18 +212,13 @@ export default class Pdf2MdPlugin extends Plugin {
           try {
             const buffer = await file.arrayBuffer();
             const audit = this.settings.autoAuditInvoices;
-            if (audit || this.settings.createSeparateNote) {
-              const folder = view.file?.parent?.path ?? '';
-              const pdfPath = await this.savePdfToVault(file.name, buffer, folder);
-              const { content } = await this.buildNoteContent(file.name, buffer, pdfPath, audit);
-              const noteName = pdfPath.replace(/\.pdf$/i, '.md');
-              await this.app.vault.create(noteName, content);
-              new Notice(`[pdf2w] Created ${noteName}!`);
-            } else {
-              const res = await this.convert(file.name, buffer, { audit: false });
-              editor.replaceSelection(res.markdown);
-              new Notice(`[pdf2w] Injected ${file.name} Markdown!`);
-            }
+            await this.debugLog(`drop: ${file.name} | autoAuditInvoices=${audit} | detectTables=${this.settings.detectTables}`);
+            const folder = view.file?.parent?.path ?? '';
+            const pdfPath = await this.savePdfToVault(file.name, buffer, folder);
+            const { content } = await this.buildNoteContent(file.name, buffer, pdfPath, audit);
+            const noteName = pdfPath.replace(/\.pdf$/i, '.md');
+            await this.app.vault.create(noteName, content);
+            new Notice(`[pdf2w] Created ${noteName}!`);
             this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
           } catch (err: any) {
             this.setStatus('✖ pdf2w: error', 4000);
@@ -245,6 +240,24 @@ export default class Pdf2MdPlugin extends Plugin {
     }
   }
 
+  /** Appends a timestamped line to a vault-root debug log note, when Debug logging is enabled. Best-effort: a logging failure must never break a conversion. */
+  async debugLog(message: string) {
+    if (!this.settings.debugMode) return;
+    console.log(`[pdf2w:debug] ${message}`);
+    const line = `[${new Date().toISOString()}] ${message}\n`;
+    const path = 'pdf2w-debug.log.md';
+    try {
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      if (existing instanceof TFile) {
+        await this.app.vault.append(existing, line);
+      } else {
+        await this.app.vault.create(path, line);
+      }
+    } catch {
+      // Best-effort — logging must never break a conversion.
+    }
+  }
+
   /** POST /convert — raw PDF body, JSON response. Works against both the local self-hosted server and the SaaS gateway. */
   async convert(filename: string, data: ArrayBuffer, opts: { audit: boolean }): Promise<ConvertResponse> {
     const base = this.settings.serviceUrl.replace(/\/$/, '');
@@ -260,15 +273,17 @@ export default class Pdf2MdPlugin extends Plugin {
     };
     if (this.settings.apiKey.trim()) headers['Authorization'] = `Bearer ${this.settings.apiKey.trim()}`;
 
-    const response = await fetch(url, { method: 'POST', headers, body: data });
-    const text = await response.text();
+    await this.debugLog(`convert() → POST ${url} | filename=${filename} | audit_requested=${opts.audit} | vectors=${this.settings.detectTables}`);
+    const response = await requestUrl({ url, method: 'POST', headers, body: data, throw: false });
+    const text = response.text;
     let json: any;
     try {
       json = JSON.parse(text);
     } catch {
       throw new Error(`Unexpected response (HTTP ${response.status}): ${text.slice(0, 200)}`);
     }
-    if (!response.ok || json.ok === false) {
+    await this.debugLog(`convert() ← HTTP ${response.status} | ok=${json.ok} | engine=${json.engine ?? 'n/a'} | pages=${json.pages ?? 'n/a'} | credits_consumed=${json.credits_consumed ?? 'n/a'} | french_invoice=${json.french_invoice ? 'present' : 'absent'} | french_invoice_error=${json.french_invoice_error ?? 'none'} | error=${json.error ?? 'none'}`);
+    if (response.status < 200 || response.status >= 300 || json.ok === false) {
       throw new Error(json.error || `HTTP ${response.status}`);
     }
     return json as ConvertResponse;
@@ -280,9 +295,11 @@ export default class Pdf2MdPlugin extends Plugin {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.settings.apiKey.trim()) headers['Authorization'] = `Bearer ${this.settings.apiKey.trim()}`;
 
-    const response = await fetch(`${base}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
-    const text = await response.text();
-    if (!response.ok) {
+    await this.debugLog(`postJson() → POST ${base}${path}`);
+    const response = await requestUrl({ url: `${base}${path}`, method: 'POST', headers, body: JSON.stringify(body), throw: false });
+    const text = response.text;
+    await this.debugLog(`postJson() ← HTTP ${response.status} | body=${text.slice(0, 300)}`);
+    if (response.status < 200 || response.status >= 300) {
       let msg = text;
       try {
         msg = JSON.parse(text).error ?? text;
@@ -302,6 +319,7 @@ export default class Pdf2MdPlugin extends Plugin {
     audit: boolean
   ): Promise<{ content: string; res: ConvertResponse }> {
     const res = await this.convert(filename, buffer, { audit });
+    await this.debugLog(`buildNoteContent(): audit=${audit} | french_invoice=${!!res.french_invoice} | french_invoice_error=${res.french_invoice_error ?? 'none'}`);
     let content = '';
     if (audit && res.french_invoice) {
       content += buildInvoiceFrontmatter(res.french_invoice, pdfPath) + '\n\n';
@@ -347,33 +365,28 @@ export default class Pdf2MdPlugin extends Plugin {
     }
   }
 
-  promptPdfConversion(editor?: Editor, opts: { audit: boolean } = { audit: false }) {
+  promptPdfConversion(opts: { audit: boolean } = { audit: false }) {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.pdf';
     input.onchange = async () => {
       const file = input.files?.[0];
       if (!file) return;
+      const audit = opts.audit || this.settings.autoAuditInvoices;
       const start = Date.now();
       this.setStatus(`⚡ pdf2w: converting ${file.name}...`);
       try {
         const buffer = await file.arrayBuffer();
         const activeFile = this.app.workspace.getActiveFile();
         const folder = activeFile?.parent?.path ?? '';
+        await this.debugLog(`picker: ${file.name} | audit_requested=${audit} | detectTables=${this.settings.detectTables}`);
 
-        if (opts.audit || this.settings.createSeparateNote || !editor) {
-          const pdfPath = await this.savePdfToVault(file.name, buffer, folder);
-          const { content } = await this.buildNoteContent(file.name, buffer, pdfPath, opts.audit);
-          const noteName = pdfPath.replace(/\.pdf$/i, '.md');
-          await this.app.vault.create(noteName, content);
-          this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
-          new Notice(`✔ Saved as ${noteName}`);
-        } else {
-          const res = await this.convert(file.name, buffer, { audit: false });
-          editor.replaceSelection(res.markdown);
-          this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
-          new Notice(`✔ Injected into active note!`);
-        }
+        const pdfPath = await this.savePdfToVault(file.name, buffer, folder);
+        const { content } = await this.buildNoteContent(file.name, buffer, pdfPath, audit);
+        const noteName = pdfPath.replace(/\.pdf$/i, '.md');
+        await this.app.vault.create(noteName, content);
+        this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
+        new Notice(`✔ Saved as ${noteName}`);
       } catch (err: any) {
         this.setStatus('✖ pdf2w: error', 4000);
         new Notice(`✖ Error: ${err.message}`);
@@ -568,16 +581,6 @@ class Pdf2MdSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Create Separate Note on Drop')
-      .setDesc('When dropping a PDF, create a new .md note instead of inserting into the active note.')
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.createSeparateNote).onChange(async (value) => {
-          this.plugin.settings.createSeparateNote = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
       .setName('Detect tables via vector graphics')
       .setDesc('Adds ?vectors=1 to conversion requests — reconstructs tables from PDF drawing commands, not just text layout. More accurate on ruled tables, slightly slower.')
       .addToggle((toggle) =>
@@ -593,6 +596,16 @@ class Pdf2MdSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoAuditInvoices).onChange(async (value) => {
           this.plugin.settings.autoAuditInvoices = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Debug logging')
+      .setDesc('Append a trace of every request/response to a "pdf2w-debug.log.md" note at your vault root — open it in Obsidian to see exactly what was sent and what the server returned (useful for diagnosing e.g. why an invoice audit did or did not run). Off by default; the log file is never created unless this is on.')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.debugMode).onChange(async (value) => {
+          this.plugin.settings.debugMode = value;
           await this.plugin.saveSettings();
         })
       );

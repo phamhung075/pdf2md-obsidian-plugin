@@ -4,8 +4,8 @@
   "description": "Obsidian community plugin to convert PDFs into clean Markdown notes with reconstructed tables using pdf2md-core.",
   "main": "main.js",
   "scripts": {
-    "dev": "esbuild main.ts --bundle --outfile=main.js --watch --external:obsidian",
-    "build": "esbuild main.ts --bundle --outfile=main.js --minify --external:obsidian"
+    "dev": "esbuild main.ts --bundle --outfile=main.js --watch --external:obsidian --format=cjs",
+    "build": "esbuild main.ts --bundle --outfile=main.js --minify --external:obsidian --format=cjs"
   },
   "keywords": [
     "obsidian",
