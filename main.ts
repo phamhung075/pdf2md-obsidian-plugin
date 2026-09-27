@@ -345,16 +345,29 @@ export default class Pdf2MdPlugin extends Plugin {
     return path;
   }
 
+  /** Returns `path` if free, else the first free `name 1.ext`, `name 2.ext`, … sibling. Never overwrites. */
+  freePath(path: string): string {
+    if (!this.app.vault.getAbstractFileByPath(path)) return path;
+    const dot = path.lastIndexOf('.');
+    const base = dot > 0 ? path.slice(0, dot) : path;
+    const ext = dot > 0 ? path.slice(dot) : '';
+    let i = 1;
+    let candidate = `${base} ${i}${ext}`;
+    while (this.app.vault.getAbstractFileByPath(candidate)) {
+      i++;
+      candidate = `${base} ${i}${ext}`;
+    }
+    return candidate;
+  }
+
   async handlePdfToNote(file: TFile, opts: { audit: boolean }) {
     const start = Date.now();
     this.setStatus(`⚡ pdf2w: converting ${file.name}...`);
     try {
       const buffer = await this.app.vault.readBinary(file);
       const { content, res } = await this.buildNoteContent(file.name, buffer, file.path, opts.audit);
-      const newPath = file.path.replace(/\.pdf$/i, '.md');
-      const existing = this.app.vault.getAbstractFileByPath(newPath);
-      if (existing instanceof TFile) await this.app.vault.modify(existing, content);
-      else await this.app.vault.create(newPath, content);
+      const newPath = this.freePath(file.path.replace(/\.pdf$/i, '.md'));
+      await this.app.vault.create(newPath, content);
 
       this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
       const creditNote = res.credits_consumed ? ` · ${res.credits_consumed} credit${res.credits_consumed === 1 ? '' : 's'}` : '';
@@ -424,10 +437,8 @@ export default class Pdf2MdPlugin extends Plugin {
 
     try {
       const fec = await this.postJson('/v1/invoices/export/fec', { audit, ecriture_num: ecritureNum });
-      const fecPath = file.path.replace(/\.md$/i, '_FEC.txt');
-      const existing = this.app.vault.getAbstractFileByPath(fecPath);
-      if (existing instanceof TFile) await this.app.vault.modify(existing, fec);
-      else await this.app.vault.create(fecPath, fec);
+      const fecPath = this.freePath(file.path.replace(/\.md$/i, '_FEC.txt'));
+      await this.app.vault.create(fecPath, fec);
       new Notice(`✔ FEC entry written to ${fecPath}`);
     } catch (e: any) {
       new Notice(`✖ FEC export failed: ${e.message}`);
@@ -480,11 +491,9 @@ export default class Pdf2MdPlugin extends Plugin {
     }
 
     const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const outPath = `${folder.path}/FEC_export_${stamp}.txt`;
-    const existingOut = this.app.vault.getAbstractFileByPath(outPath);
     const outContent = lines.join('\n') + '\n';
-    if (existingOut instanceof TFile) await this.app.vault.modify(existingOut, outContent);
-    else await this.app.vault.create(outPath, outContent);
+    const outPath = this.freePath(`${folder.path}/FEC_export_${stamp}.txt`);
+    await this.app.vault.create(outPath, outContent);
 
     const skippedNote = skipped.length ? ` (${skipped.length} skipped — see console)` : '';
     new Notice(`✔ Exported ${entries.length - skipped.length}/${entries.length} invoices to ${outPath}${skippedNote}`);
@@ -503,6 +512,7 @@ export default class Pdf2MdPlugin extends Plugin {
 /** Minimal single-field text prompt, since Obsidian disallows window.prompt(). */
 class PromptModal extends Modal {
   private value = '';
+  private submitted = false;
   private resolveFn: (v: string | null) => void = () => {};
 
   constructor(app: App, private title: string, private defaultValue: string) {
@@ -526,6 +536,7 @@ class PromptModal extends Modal {
     input.select();
 
     const submit = () => {
+      this.submitted = true;
       this.value = input.value.trim();
       this.close();
     };
@@ -537,7 +548,7 @@ class PromptModal extends Modal {
 
   onClose() {
     this.contentEl.empty();
-    this.resolveFn(this.value || null);
+    this.resolveFn(this.submitted ? this.value || null : null);
   }
 }
 
