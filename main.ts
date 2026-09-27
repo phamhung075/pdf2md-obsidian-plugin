@@ -54,6 +54,11 @@ interface ConvertResponse {
 
 const AUDIT_BLOCK_RE = /%%pdf2w-audit\n([\s\S]*?)\n%%/;
 
+// A freePath() pick is a check-then-create: two conversions racing can pick the
+// same path and the loser's vault.create rejects with "already exists". Retry
+// that many times, each retry re-picking the next free sibling.
+const FREE_PATH_MAX_ATTEMPTS = 10;
+
 function yamlScalar(v: string): string {
   return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
@@ -216,8 +221,7 @@ export default class Pdf2MdPlugin extends Plugin {
             const folder = view.file?.parent?.path ?? '';
             const pdfPath = await this.savePdfToVault(file.name, buffer, folder);
             const { content } = await this.buildNoteContent(file.name, buffer, pdfPath, audit);
-            const noteName = pdfPath.replace(/\.pdf$/i, '.md');
-            await this.app.vault.create(noteName, content);
+            const noteName = await this.createAtFreePath(pdfPath.replace(/\.pdf$/i, '.md'), content);
             new Notice(`[pdf2w] Created ${noteName}!`);
             this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
           } catch (err: any) {
@@ -360,15 +364,35 @@ export default class Pdf2MdPlugin extends Plugin {
     return candidate;
   }
 
+  /**
+   * Creates `content` at the first free path near `preferredPath`. freePath() is
+   * a check-then-create, so a concurrent conversion can win the race between the
+   * pick and the create; that "already exists" rejection re-picks the next free
+   * sibling of `preferredPath` (keeping the canonical `name 1`, `name 2` … order),
+   * bounded by FREE_PATH_MAX_ATTEMPTS. Any other error propagates.
+   */
+  async createAtFreePath(preferredPath: string, content: string): Promise<string> {
+    let candidate = this.freePath(preferredPath);
+    for (let attempt = 1; attempt <= FREE_PATH_MAX_ATTEMPTS; attempt++) {
+      try {
+        await this.app.vault.create(candidate, content);
+        return candidate;
+      } catch (e: any) {
+        const lostRace = /already exists/i.test(String(e?.message ?? e));
+        if (!lostRace || attempt === FREE_PATH_MAX_ATTEMPTS) throw e;
+        candidate = this.freePath(preferredPath);
+      }
+    }
+    throw new Error(`[pdf2w] could not allocate a free path near ${preferredPath}`);
+  }
+
   async handlePdfToNote(file: TFile, opts: { audit: boolean }) {
     const start = Date.now();
     this.setStatus(`⚡ pdf2w: converting ${file.name}...`);
     try {
       const buffer = await this.app.vault.readBinary(file);
       const { content, res } = await this.buildNoteContent(file.name, buffer, file.path, opts.audit);
-      const newPath = this.freePath(file.path.replace(/\.pdf$/i, '.md'));
-      await this.app.vault.create(newPath, content);
-
+      const newPath = await this.createAtFreePath(file.path.replace(/\.pdf$/i, '.md'), content);
       this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
       const creditNote = res.credits_consumed ? ` · ${res.credits_consumed} credit${res.credits_consumed === 1 ? '' : 's'}` : '';
       new Notice(`✔ Converted to ${newPath}${creditNote}`);
@@ -396,8 +420,7 @@ export default class Pdf2MdPlugin extends Plugin {
 
         const pdfPath = await this.savePdfToVault(file.name, buffer, folder);
         const { content } = await this.buildNoteContent(file.name, buffer, pdfPath, audit);
-        const noteName = pdfPath.replace(/\.pdf$/i, '.md');
-        await this.app.vault.create(noteName, content);
+        const noteName = await this.createAtFreePath(pdfPath.replace(/\.pdf$/i, '.md'), content);
         this.setStatus(`✔ pdf2w: done in ${Date.now() - start}ms`, 3000);
         new Notice(`✔ Saved as ${noteName}`);
       } catch (err: any) {
@@ -437,8 +460,7 @@ export default class Pdf2MdPlugin extends Plugin {
 
     try {
       const fec = await this.postJson('/v1/invoices/export/fec', { audit, ecriture_num: ecritureNum });
-      const fecPath = this.freePath(file.path.replace(/\.md$/i, '_FEC.txt'));
-      await this.app.vault.create(fecPath, fec);
+      const fecPath = await this.createAtFreePath(file.path.replace(/\.md$/i, '_FEC.txt'), fec);
       new Notice(`✔ FEC entry written to ${fecPath}`);
     } catch (e: any) {
       new Notice(`✖ FEC export failed: ${e.message}`);
@@ -492,8 +514,7 @@ export default class Pdf2MdPlugin extends Plugin {
 
     const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     const outContent = lines.join('\n') + '\n';
-    const outPath = this.freePath(`${folder.path}/FEC_export_${stamp}.txt`);
-    await this.app.vault.create(outPath, outContent);
+    const outPath = await this.createAtFreePath(`${folder.path}/FEC_export_${stamp}.txt`, outContent);
 
     const skippedNote = skipped.length ? ` (${skipped.length} skipped — see console)` : '';
     new Notice(`✔ Exported ${entries.length - skipped.length}/${entries.length} invoices to ${outPath}${skippedNote}`);
