@@ -273,7 +273,10 @@ export default class Pdf2MdPlugin extends Plugin {
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/pdf',
-      'X-File-Name': filename,
+      // Both servers PathUnescape X-File-Name and dev_ui's infra/api.js encodes
+      // it; sending the raw name would silently rewrite a `%XX` or non-ASCII
+      // filename on arrival.
+      'X-File-Name': encodeURIComponent(filename),
     };
     if (this.settings.apiKey.trim()) headers['Authorization'] = `Bearer ${this.settings.apiKey.trim()}`;
 
